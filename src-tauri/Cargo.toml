@@ -98,6 +98,7 @@ bytes = "1"
 # `rand` mints the per-cast URL token (the server serves exactly one registered
 # file, never a directory).
 mdns-sd = "0.20"
+rcgen = "0.13"
 if-addrs = "0.13"
 # SSDP has to leave by a named interface, which needs IP_MULTICAST_IF — neither
 # std nor tokio exposes it. Already in the tree via hyper/tokio.
@@ -115,6 +116,8 @@ tauri-plugin-deep-link = "2.4.9"
 # for what the other codecs would have bought.
 zip = { version = "4", default-features = false, features = ["deflate-flate2"] }
 sha2 = "0.10"
+# Direct use of the copy already in the tree for LAN preview JPEGs.
+base64 = "0.22"
 
 # macOS: native window chrome (rounded corners, transparent title bar, the
 # system traffic-light buttons) — see macos_chrome in lib.rs.

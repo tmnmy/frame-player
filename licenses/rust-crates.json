@@ -1200,6 +1200,11 @@
     "license": "MIT OR Apache-2.0"
   },
   {
+    "name": "pem",
+    "version": "3.0.6",
+    "license": "MIT"
+  },
+  {
     "name": "percent-encoding",
     "version": "2.3.2",
     "license": "MIT OR Apache-2.0"
@@ -1383,6 +1388,11 @@
     "name": "raw-window-handle",
     "version": "0.6.2",
     "license": "MIT OR Apache-2.0 OR Zlib"
+  },
+  {
+    "name": "rcgen",
+    "version": "0.13.2",
+    "license": "MIT OR Apache-2.0"
   },
   {
     "name": "ref-cast",
@@ -2142,6 +2152,11 @@
   {
     "name": "xattr",
     "version": "1.6.1",
+    "license": "MIT OR Apache-2.0"
+  },
+  {
+    "name": "yasna",
+    "version": "0.5.2",
     "license": "MIT OR Apache-2.0"
   },
   {

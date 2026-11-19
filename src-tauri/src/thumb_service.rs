@@ -126,6 +126,10 @@ unsafe impl Send for ThumbSession {}
 
 impl ThumbSession {
     fn open(path: &str) -> Result<Self, String> {
+        Self::open_with_threads(path, DECODE_THREADS)
+    }
+
+    fn open_with_threads(path: &str, threads: usize) -> Result<Self, String> {
         let ictx = ffmpeg::format::input(path).map_err(|e| format!("open: {e}"))?;
         let stream = ictx
             .streams()
@@ -149,7 +153,7 @@ impl ThumbSession {
         // background work and must not claim the whole machine.
         dec_ctx.set_threading(ffmpeg::codec::threading::Config {
             kind: ffmpeg::codec::threading::Type::Frame,
-            count: DECODE_THREADS,
+            count: threads,
         });
         let decoder = dec_ctx
             .decoder()
@@ -434,9 +438,13 @@ impl ThumbSession {
     }
 
     fn encode_current(&mut self) -> Result<Vec<u8>, String> {
+        self.encode_current_with_quality(JPEG_QUALITY)
+    }
+
+    fn encode_current_with_quality(&mut self, quality: u8) -> Result<Vec<u8>, String> {
         let tight = self.scaled_rgb()?;
         let mut jpeg = Vec::new();
-        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, JPEG_QUALITY)
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut jpeg, quality)
             .encode(
                 &tight,
                 self.out_w,
@@ -736,6 +744,187 @@ fn cache_path_for(app: &tauri::AppHandle, path: &str) -> Option<PathBuf> {
         }
     }
     Some(thumbs_dir(app)?.join(format!("{:016x}.ktb", h.finish())))
+}
+
+// 45,000 bytes of JPEG become 60,000 bytes of Base64, leaving room for
+// NDJSON framing in the Android client's 65,536-byte reply buffer.
+pub(crate) const REMOTE_JPEG_LIMIT: usize = 45_000;
+
+pub(crate) fn can_remote_preview_path(path: &str) -> bool {
+    is_local_preview_path(std::path::Path::new(path)) && !is_private_preview_path(path)
+}
+
+fn remote_preview_source(path: &str) -> Option<String> {
+    if !can_remote_preview_path(path) {
+        return None;
+    }
+    #[cfg(windows)]
+    let canonical = dunce::canonicalize(path).ok()?;
+    #[cfg(not(windows))]
+    let canonical = std::fs::canonicalize(path).ok()?;
+    if !is_local_preview_path(&canonical) || !canonical.is_file() {
+        return None;
+    }
+    let canonical_path = canonical.to_str()?;
+    (!is_private_preview_path(canonical_path)).then(|| canonical_path.to_owned())
+}
+
+fn limit_remote_dimensions(decoder: &mut ThumbSession) {
+    if decoder.out_h > THUMB_WIDTH {
+        decoder.out_w = ((decoder.out_w as f64 * THUMB_WIDTH as f64 / decoder.out_h as f64)
+            .round().max(2.0) as u32) & !1;
+        decoder.out_h = THUMB_WIDTH;
+    }
+}
+
+/// An independent decoder that moves forward with the remote playback clock.
+/// Keeping the demuxer, codec and scaler warm avoids reopening a file or
+/// decoding the same GOP for every displayed frame.
+pub(crate) struct LivePreviewDecoder {
+    path: String,
+    inner: ThumbSession,
+    last_target: Option<f64>,
+    last_sent_pts: Option<f64>,
+}
+
+impl LivePreviewDecoder {
+    pub(crate) fn open(path: &str) -> Result<Self, String> {
+        let path = remote_preview_source(path).ok_or("preview unavailable")?;
+        background_qos();
+        let mut inner = ThumbSession::open_with_threads(&path, 1)?;
+        limit_remote_dimensions(&mut inner);
+        Ok(Self { path, inner, last_target: None, last_sent_pts: None })
+    }
+
+    pub(crate) fn canonical_path(&self) -> &str {
+        &self.path
+    }
+
+    pub(crate) fn is_private(&self) -> bool {
+        is_private_preview_path(&self.path)
+    }
+
+    pub(crate) fn render(&mut self, target: f64, reset: bool) -> Result<Option<Vec<u8>>, String> {
+        let seek = reset || self.last_target.is_none()
+            || self.last_target.is_some_and(|previous| previous > target + 0.20);
+        let changed = self.last_target.is_none_or(|previous| (previous - target).abs() > PTS_EPS);
+        self.last_target = Some(target);
+        if seek {
+            self.inner.seek_to_keyframe(target)?;
+            self.last_sent_pts = None;
+            if !self.inner.decode_next()? {
+                return Ok(None);
+            }
+        } else if self.inner.cur_pts.is_none() && (!changed || !self.inner.decode_next()?) {
+            return Ok(None);
+        }
+
+        let started = std::time::Instant::now();
+        // Catch up progressively on long GOPs, without claiming an unbounded
+        // slice of the playback machine or emitting unrelated keyframes.
+        for _ in 0..24 {
+            if self.inner.cur_pts.is_none_or(|pts| pts >= target - 0.020)
+                || started.elapsed() >= std::time::Duration::from_millis(42)
+                || !self.inner.decode_next()?
+            {
+                break;
+            }
+        }
+        if let Some(pts) = self.inner.cur_pts {
+            if pts < target - 0.35 || self.last_sent_pts == Some(pts) {
+                return Ok(None);
+            }
+        }
+        let jpeg = self.inner.encode_current_with_quality(62)?;
+        if jpeg.len() > REMOTE_JPEG_LIMIT {
+            return Ok(None);
+        }
+        self.last_sent_pts = self.inner.cur_pts;
+        Ok(Some(jpeg))
+    }
+}
+
+/// One still for the phone. Read a matching in-memory grid cell opportunistically,
+/// otherwise decode in an independent session without writing to the cache.
+pub(crate) fn remote_preview_frame(
+    state: &ThumbState,
+    path: &str,
+    position: f64,
+) -> Option<(String, Vec<u8>)> {
+    remote_frame(state, path, position, 2.0)
+}
+
+pub(crate) fn remote_scrub_frame(
+    state: &ThumbState,
+    path: &str,
+    position: f64,
+) -> Option<(String, Vec<u8>)> {
+    remote_frame(state, path, position, 0.20)
+}
+
+fn remote_frame(
+    state: &ThumbState,
+    path: &str,
+    position: f64,
+    cache_tolerance: f64,
+) -> Option<(String, Vec<u8>)> {
+    let canonical_path = remote_preview_source(path)?;
+    let cached = state.inner.try_lock().ok().and_then(|inner| {
+        if inner.path != path || inner.interval <= 0.0 {
+            return None;
+        }
+        let bucket = bucket_for(position, inner.interval, inner.duration);
+        let (pts, jpeg) = inner.thumbs.get(&bucket)?;
+        ((pts - position).abs() <= cache_tolerance && jpeg.len() <= REMOTE_JPEG_LIMIT).then(|| jpeg.clone())
+    });
+    if let Some(jpeg) = cached {
+        let size = image::ImageReader::with_format(std::io::Cursor::new(&jpeg), image::ImageFormat::Jpeg)
+            .into_dimensions();
+        if size.is_ok_and(|(w, h)| w <= THUMB_WIDTH && h <= THUMB_WIDTH) {
+            return Some((canonical_path, jpeg));
+        }
+    }
+
+    let mut decoder = ThumbSession::open_with_threads(&canonical_path, 1).ok()?;
+    decoder.seek_to_keyframe(position).ok()?;
+    if !decoder.decode_next().ok()? {
+        return None;
+    }
+    // Refine a short distance toward the playing frame without monopolising
+    // the CPU on long GOPs. The fallback remains a real still from the video.
+    let started = std::time::Instant::now();
+    for _ in 0..32 {
+        if decoder.cur_pts.is_none_or(|pts| pts >= position - PTS_EPS)
+            || started.elapsed() >= std::time::Duration::from_millis(180)
+            || !decoder.decode_next().unwrap_or(false)
+        {
+            break;
+        }
+    }
+    limit_remote_dimensions(&mut decoder);
+    let jpeg = decoder.encode_current_with_quality(66).ok()?;
+    (jpeg.len() <= REMOTE_JPEG_LIMIT).then_some((canonical_path, jpeg))
+}
+
+pub(crate) fn is_private_preview_path(path: &str) -> bool {
+    #[cfg(windows)]
+    let path = path.strip_prefix(r"\\?\").unwrap_or(path);
+    is_private(path)
+}
+
+/// Windows UNC paths are not local, including verbatim UNC paths. Leave
+/// ordinary and long drive-letter paths available for the user.
+fn is_local_preview_path(path: &std::path::Path) -> bool {
+    #[cfg(windows)]
+    {
+        use std::path::{Component, Prefix};
+        if !matches!(path.components().next(),
+            Some(Component::Prefix(prefix)) if matches!(prefix.kind(), Prefix::Disk(_) | Prefix::VerbatimDisk(_)))
+        {
+            return false;
+        }
+    }
+    path.is_absolute()
 }
 
 /// Poster frame for the start screen: [f64 pts LE][JPEG].
@@ -1174,6 +1363,47 @@ pub fn thumb_start(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn remote_live_preview_smoke() {
+        let Ok(path) = std::env::var("FP_REMOTE_LIVE_FIXTURE") else {
+            return;
+        };
+        super::ffmpeg::init().unwrap();
+        let mut decoder = super::LivePreviewDecoder::open(&path).unwrap();
+        let mut previous = None;
+        for position in [0.25, 0.32, 0.39, 0.46, 0.53] {
+            let jpeg = decoder.render(position, false).unwrap().expect("live frame");
+            assert!(jpeg.len() <= super::REMOTE_JPEG_LIMIT);
+            let image = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg).unwrap();
+            assert!(image.width() <= 320 && image.height() <= 320);
+            assert_ne!(previous.as_ref(), Some(&jpeg));
+            previous = Some(jpeg);
+        }
+        assert!(decoder.render(0.53, false).unwrap().is_none(), "paused frame should not repeat");
+        let after_seek = (0..12).find_map(|attempt| decoder.render(4.0, attempt == 0).unwrap());
+        let after_seek = after_seek.expect("frame after seek");
+        assert!((decoder.inner.cur_pts.unwrap() - 4.0).abs() < 0.35);
+        assert_ne!(previous, Some(after_seek));
+        let (_, scrub) = super::remote_scrub_frame(&super::ThumbState::default(), &path, 2.0)
+            .expect("scrub still");
+        assert!(image::load_from_memory_with_format(&scrub, image::ImageFormat::Jpeg).is_ok());
+    }
+
+    #[test]
+    fn remote_preview_frame_smoke() {
+        let Ok(path) = std::env::var("FP_REMOTE_PREVIEW_FIXTURE") else {
+            return;
+        };
+        super::ffmpeg::init().expect("FFmpeg init");
+        let (_, jpeg) = super::remote_preview_frame(&super::ThumbState::default(), &path, 1.0)
+            .expect("local preview frame");
+        assert!(!jpeg.is_empty() && jpeg.len() <= 45_000);
+        let image = image::load_from_memory_with_format(&jpeg, image::ImageFormat::Jpeg)
+            .expect("decodable preview JPEG");
+        assert!(image.width() >= 2 && image.width() <= 320);
+        assert!(image.height() >= 2 && image.height() <= 320);
+    }
+
     /// `FP_TEST_VIDEO=<abs path> cargo test --lib crop_smoke -- --nocapture`.
     /// Prints what the detector found; asserts only that it ran.
     #[test]

@@ -172,6 +172,8 @@ class Cast {
 
   /// A session exists, from connect until disconnect — the window is a remote.
   active = $state(false);
+  audioMode = $state<'auto' | 'stereo'>('auto');
+  audioSwitching = $state(false);
   deviceName = $state<string | null>(null);
   /// The session's device as its row drew it, for the same icon over the
   /// disconnect button. AirPlay's mark until the chosen set is known as a row.
@@ -235,6 +237,7 @@ function deviceKey(id: string, name: string, model: string): string {
 class Session {
   pollTimer: ReturnType<typeof setInterval> | null = null;
   loadStartedAt = 0;
+  audioSwitchEpoch = 0;
   /// An AirPlay session became an external route. Until then the viewer is
   /// still choosing in the system's list and the local player keeps playing —
   /// so the fetch timeouts, which count from the handover, have not started.

@@ -1,0 +1,10 @@
+<adaptive-icon xmlns:android="http://schemas.android.com/apk/res/android">
+    <background>
+        <shape>
+            <gradient android:angle="315" android:startColor="#191a2e" android:endColor="#0d0d18" />
+        </shape>
+    </background>
+    <foreground>
+        <inset android:drawable="@drawable/frame_player_logo" android:inset="25%" />
+    </foreground>
+</adaptive-icon>

@@ -28,17 +28,27 @@ const DLNA_SWEEP_MS = 4500;
 /// picker said it was still searching forever.
 const REBUILD_AFTER_EMPTY_POLLS = 9;
 
+type DiscoveryOwner = 'picker' | 'remote';
+const discoveryOwners = new Set<DiscoveryOwner>();
+let discoveryGeneration = 0;
 let deviceTimer: ReturnType<typeof setInterval> | null = null;
+let sweepTimer: ReturnType<typeof setTimeout> | undefined;
 
-export function startCastDiscovery() {
-  if (devicetimerRunning()) return;
+export function startCastDiscovery(owner: DiscoveryOwner = 'picker') {
+  const running = discoveryOwners.size > 0;
+  discoveryOwners.add(owner);
+  if (running) return;
+  const generation = ++discoveryGeneration;
   cast.discovering = true;
+  cast.devices = [];
+  cast.dlnaDevices = [];
+  cast.airplayRoutes = false;
   emptyPolls = 0;
   cast.rebuilds = 0;
   const hints = loadHosts();
   void invoke('cast_discover_start', { hints }).catch((e) => {
     console.warn('cast_discover_start failed:', e);
-    cast.discovering = false;
+    if (generation === discoveryGeneration) cast.discovering = false;
   });
   void invoke('dlna_discover_start', { hints }).catch((e) =>
     console.warn('dlna_discover_start failed:', e),
@@ -47,7 +57,7 @@ export function startCastDiscovery() {
   if (IS_MAC) void invoke('airplay_detect', { on: true }).catch(() => {});
   // Cleared by the first sweep that finds anything, or by this deadline — a
   // spinner that never stops is worse than one that gives up.
-  setTimeout(() => (cast.dlnaSweeping = false), DLNA_SWEEP_MS);
+  sweepTimer = setTimeout(() => (cast.dlnaSweeping = false), DLNA_SWEEP_MS);
   void refreshCastPlan();
   const pull = async () => {
     const [castList, dlnaList, airplayRoutes] = await Promise.all([
@@ -55,6 +65,7 @@ export function startCastDiscovery() {
       invoke<DlnaDevice[]>('dlna_devices').catch(() => []),
       IS_MAC ? invoke<boolean>('airplay_routes').catch(() => false) : false,
     ]);
+    if (generation !== discoveryGeneration) return;
     cast.devices = castList;
     cast.dlnaDevices = dlnaList;
     cast.airplayRoutes = airplayRoutes;
@@ -63,7 +74,7 @@ export function startCastDiscovery() {
     if (castList.length || dlnaList.length) {
       emptyPolls = 0;
     } else if (++emptyPolls >= REBUILD_AFTER_EMPTY_POLLS) {
-      void rebuildDiscovery();
+      void rebuildDiscovery(generation);
     }
     // Only while the source is a torrent still downloading: it is the one plan
     // that changes under the panel, and re-reading it for a plain file would be
@@ -76,10 +87,11 @@ export function startCastDiscovery() {
 
 /// Tear Cast discovery down and start it again. Cheap: one mDNS daemon. DLNA
 /// is left running — see `REBUILD_AFTER_EMPTY_POLLS`.
-async function rebuildDiscovery() {
+async function rebuildDiscovery(generation: number) {
   emptyPolls = 0;
   cast.rebuilds++;
   await invoke('cast_discover_stop').catch(() => {});
+  if (generation !== discoveryGeneration) return;
   await invoke('cast_discover_start', { hints: loadHosts() }).catch(() => {});
 }
 
@@ -123,11 +135,10 @@ function rememberHosts(seen: string[]) {
   }
 }
 
-function devicetimerRunning(): boolean {
-  return deviceTimer !== null;
-}
-
-export function stopCastDiscovery() {
+export function stopCastDiscovery(owner: DiscoveryOwner = 'picker') {
+  if (!discoveryOwners.delete(owner) || discoveryOwners.size > 0) return;
+  discoveryGeneration++;
+  clearTimeout(sweepTimer);
   if (deviceTimer !== null) {
     clearInterval(deviceTimer);
     deviceTimer = null;

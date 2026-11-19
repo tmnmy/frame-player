@@ -64,7 +64,7 @@ pub(crate) fn ffmpeg_bin(app: &tauri::AppHandle) -> Option<PathBuf> {
 /// Cache key: source identity (path + size + mtime, the thumbnail cache's
 /// convention) plus what was asked of the transcode — a different audio track
 /// or rung is a different output.
-pub(super) fn prepare_key(path: &std::path::Path, meta: &std::fs::Metadata, audio_index: i64, transcode: bool) -> String {
+pub(super) fn prepare_key(path: &std::path::Path, meta: &std::fs::Metadata, audio_index: i64, transcode: bool, stereo: bool) -> String {
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     path.to_string_lossy().hash(&mut h);
@@ -76,6 +76,10 @@ pub(super) fn prepare_key(path: &std::path::Path, meta: &std::fs::Metadata, audi
     }
     audio_index.hash(&mut h);
     transcode.hash(&mut h);
+    // Preserve existing Auto cache identities.
+    if stereo {
+        "stereo-aac-v1".hash(&mut h);
+    }
     format!("{:016x}", h.finish())
 }
 
@@ -83,7 +87,7 @@ pub(super) fn prepare_key(path: &std::path::Path, meta: &std::fs::Metadata, audi
 /// LRU by mtime; the file just produced is never pruned — a cap of zero
 /// therefore means "keep nothing but the current session's file", and the
 /// frontend deletes that one too when the session ends.
-pub(super) fn prune_cast_cache(dir: &std::path::Path, keep: &std::path::Path, cap: u64) {
+pub(super) fn prune_cast_cache(dir: &std::path::Path, keep: &std::path::Path, serving: Option<&std::path::Path>, cap: u64) {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
@@ -91,7 +95,7 @@ pub(super) fn prune_cast_cache(dir: &std::path::Path, keep: &std::path::Path, ca
         .flatten()
         .filter_map(|e| {
             let p = e.path();
-            if !p.is_file() || p == keep {
+            if !p.is_file() || p == keep || serving == Some(p.as_path()) {
                 return None;
             }
             let m = e.metadata().ok()?;
@@ -139,7 +143,7 @@ pub(super) fn tracks_key(
     use std::hash::{Hash, Hasher};
     let mut h = std::collections::hash_map::DefaultHasher::new();
     "tracks-v1".hash(&mut h);
-    prepare_key(src, meta, -1, false).hash(&mut h);
+    prepare_key(src, meta, -1, false, false).hash(&mut h);
     for t in audio.iter().chain(subs) {
         t.hash(&mut h);
         if let Some(f) = &t.file {
@@ -256,6 +260,7 @@ pub(super) fn run_prepare(
     out: &std::path::Path,
     audio_index: i64,
     transcode_audio: bool,
+    stereo: bool,
     channels: i64,
     hevc_tag: bool,
     duration: f64,
@@ -275,7 +280,11 @@ pub(super) fn run_prepare(
         // hence conditional.
         cmd.args(["-tag:v", "hvc1"]);
     }
-    if transcode_audio {
+    if stereo {
+        // FFmpeg maps the declared input layout to stereo, including both
+        // surround pairs of 7.1. The video is still stream-copied.
+        cmd.args(["-c:a", "aac", "-b:a", "192k", "-ac", "2"]);
+    } else if transcode_audio {
         cmd.args(["-c:a", "eac3", "-b:a", "640k"]);
         // E-AC-3 tops out at 5.1: a 7.1 TrueHD/DTS-HD core folds down, a
         // stereo source must NOT be upmixed — hence conditional.
@@ -295,6 +304,7 @@ pub(super) fn run_prepare(
     prune_cast_cache(
         out.parent().unwrap_or(std::path::Path::new(".")),
         out,
+        super::served_path(service).as_deref(),
         cap_bytes,
     );
     Ok(())
@@ -465,14 +475,15 @@ mod tests {
     #[test]
     fn prepare_key_changes_with_what_changes_the_copy() {
         let (path, meta) = scratch("film.mkv", b"one");
-        let key = prepare_key(&path, &meta, 1, false);
-        assert_eq!(key, prepare_key(&path, &meta, 1, false));
-        assert_ne!(key, prepare_key(&path, &meta, 2, false));
-        assert_ne!(key, prepare_key(&path, &meta, 1, true));
-        assert_ne!(key, prepare_key(&path.with_file_name("other.mkv"), &meta, 1, false));
+        let key = prepare_key(&path, &meta, 1, false, false);
+        assert_eq!(key, prepare_key(&path, &meta, 1, false, false));
+        assert_ne!(key, prepare_key(&path, &meta, 2, false, false));
+        assert_ne!(key, prepare_key(&path, &meta, 1, true, false));
+        assert_ne!(prepare_key(&path, &meta, 1, true, false), prepare_key(&path, &meta, 1, true, true));
+        assert_ne!(key, prepare_key(&path.with_file_name("other.mkv"), &meta, 1, false, false));
         // The same path holding another file — a season re-downloaded in place.
         let (_, longer) = scratch("film.mkv", b"one more");
-        assert_ne!(key, prepare_key(&path, &longer, 1, false));
+        assert_ne!(key, prepare_key(&path, &longer, 1, false, false));
         let _ = std::fs::remove_file(&path);
     }
 
@@ -504,7 +515,7 @@ mod tests {
 
         // Never mistaken for a single-track copy's key in the same cache.
         assert!(bare.starts_with('t'));
-        assert_ne!(bare, prepare_key(&src, &meta, -1, false));
+        assert_ne!(bare, prepare_key(&src, &meta, -1, false, false));
         let _ = std::fs::remove_file(&src);
         let _ = std::fs::remove_file(&srt);
     }

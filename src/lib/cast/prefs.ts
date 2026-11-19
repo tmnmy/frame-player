@@ -51,3 +51,22 @@ export function setCastCacheCapGb(gb: number) {
     // not critical
   }
 }
+
+const AUDIO_MODE_KEY = 'frameplayer.castAudioMode';
+export type CastAudioMode = 'auto' | 'stereo';
+
+export function castAudioMode(): CastAudioMode {
+  try {
+    return localStorage.getItem(AUDIO_MODE_KEY) === 'stereo' ? 'stereo' : 'auto';
+  } catch {
+    return 'auto';
+  }
+}
+
+export function rememberCastAudioMode(mode: CastAudioMode) {
+  try {
+    localStorage.setItem(AUDIO_MODE_KEY, mode);
+  } catch {
+    // The active session still uses the selected mode.
+  }
+}

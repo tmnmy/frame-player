@@ -49,3 +49,6 @@ services/relay/relay
 # Release staging: `scripts/pack-windows-update.ps1` and the release workflow
 # both write the Windows update zip and its staging tree here.
 /dist
+
+# Locally exported Android remote builds.
+/FramePlayerRemote-*.apk

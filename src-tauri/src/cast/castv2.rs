@@ -244,6 +244,8 @@ pub(super) enum Cmd {
         mime: &'static str,
         title: Option<String>,
         position: f64,
+        autoplay: bool,
+        confirmation: Option<u32>,
         /// `Some("ts" | "fmp4")` for an HLS playlist: the Default Media
         /// Receiver historically assumes TS segments, so fMP4 needs the
         /// `hlsSegmentFormat`/`hlsVideoSegmentFormat` hints in the LOAD.
@@ -274,6 +276,8 @@ pub(super) struct StatusInner {
     pub(super) reported_at: Option<Instant>,
     pub(super) rate: f64,
     pub(super) duration: f64,
+    /// Identifies a reload that the receiver reports as playing or paused.
+    pub(super) confirmed_load: Option<u32>,
     pub(super) volume: f64,
     pub(super) muted: bool,
     /// The receiver's `volume.controlType`: "master"/"attenuation" mean the
@@ -322,6 +326,21 @@ fn log_media_error(what: &str, payload: &Value) {
 
 /// Everything the pump loop needs in one place, so helpers can borrow it as a
 /// unit instead of threading six arguments.
+pub(super) struct LoadIdentity {
+    id: u32,
+    url: String,
+    media_session: Option<i64>,
+}
+
+impl LoadIdentity {
+    fn matches(&self, entry: &Value, load_request: Option<u64>, request: Option<u64>) -> bool {
+        (load_request.is_some() && request == load_request)
+            || entry["media"]["contentId"].as_str() == Some(self.url.as_str())
+            || (self.media_session.is_some()
+                && entry["mediaSessionId"].as_i64() == self.media_session)
+    }
+}
+
 pub(super) struct Pump {
     pub(super) wr: tokio::io::WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>,
     pub(super) status: Arc<Mutex<StatusInner>>,
@@ -333,6 +352,7 @@ pub(super) struct Pump {
     pub(super) pending_load: Option<Cmd>,
     /// requestId of the in-flight LOAD, to tie an error answer to it.
     pub(super) load_request: Option<u64>,
+    pub(super) verifying_load: Option<LoadIdentity>,
 }
 
 impl Pump {
@@ -364,12 +384,19 @@ impl Pump {
         title: &Option<String>,
         position: f64,
         hls_format: &Option<String>,
+        autoplay: bool,
+        confirmation: Option<u32>,
     ) -> Result<(), String> {
         let Some((session_id, transport_id)) = self.transport.clone() else {
             return Ok(());
         };
         let id = self.next_id();
         self.load_request = Some(id);
+        self.verifying_load = confirmation.map(|id| LoadIdentity {
+            id,
+            url: url.to_string(),
+            media_session: None,
+        });
         let mut media = json!({
             "contentId": url,
             "streamType": "BUFFERED",
@@ -395,12 +422,13 @@ impl Pump {
             "requestId": id,
             "sessionId": session_id,
             "media": media,
-            "autoplay": true,
+            "autoplay": autoplay,
             "currentTime": position,
         });
         set_status(&self.status, |s| {
             s.state = "loading".into();
             s.error = None;
+            s.confirmed_load = None;
         });
         self.send(NS_MEDIA, &transport_id, payload).await
     }
@@ -427,11 +455,11 @@ impl Pump {
 
     async fn handle_cmd(&mut self, cmd: Cmd) -> Result<bool, String> {
         match cmd {
-            Cmd::Load { url, mime, title, position, hls_format } => {
+            Cmd::Load { url, mime, title, position, hls_format, autoplay, confirmation } => {
                 if self.transport.is_some() {
-                    self.send_load(&url, mime, &title, position, &hls_format).await?;
+                    self.send_load(&url, mime, &title, position, &hls_format, autoplay, confirmation).await?;
                 } else {
-                    self.pending_load = Some(Cmd::Load { url, mime, title, position, hls_format });
+                    self.pending_load = Some(Cmd::Load { url, mime, title, position, hls_format, autoplay, confirmation });
                     set_status(&self.status, |s| s.state = "loading".into());
                 }
             }
@@ -564,10 +592,10 @@ impl Pump {
                                     s.state = "connected".into();
                                 }
                             });
-                            if let Some(Cmd::Load { url, mime, title, position, hls_format }) =
+                            if let Some(Cmd::Load { url, mime, title, position, hls_format, autoplay, confirmation }) =
                                 self.pending_load.take()
                             {
-                                self.send_load(&url, mime, &title, position, &hls_format).await?;
+                                self.send_load(&url, mime, &title, position, &hls_format, autoplay, confirmation).await?;
                             }
                         }
                         (Some(_), None) => {
@@ -611,9 +639,13 @@ impl Pump {
                     // receiver that reports it this way instead of
                     // LOAD_FAILED, and swallowing it would hang "loading".
                     if self.load_request.is_some() && player_state == "IDLE" {
-                        if idle_reason == "ERROR" {
+                        let for_load = self.verifying_load.as_ref().is_none_or(|load| {
+                            load.matches(entry, self.load_request, payload["requestId"].as_u64())
+                        });
+                        if idle_reason == "ERROR" && for_load {
                             log_media_error("IDLE/ERROR", &payload);
                             self.load_request = None;
+                            self.verifying_load = None;
                             set_status(&self.status, |s| {
                                 s.state = "error".into();
                                 s.error = Some("load_failed".into());
@@ -621,11 +653,30 @@ impl Pump {
                         }
                         return Ok(false);
                     }
-                    if let Some(id) = entry["mediaSessionId"].as_i64() {
+                    let media_session = entry["mediaSessionId"].as_i64();
+                    let mut confirmed_load = None;
+                    if let Some(load) = self.verifying_load.as_mut() {
+                        if !load.matches(entry, self.load_request, payload["requestId"].as_u64()) {
+                            return Ok(false);
+                        }
+                        load.media_session = media_session.or(load.media_session);
+                        if matches!(player_state, "PLAYING" | "PAUSED") {
+                            confirmed_load = Some(load.id);
+                            self.verifying_load = None;
+                        }
+                    }
+                    if let Some(id) = media_session {
                         self.media_session = Some(id);
                     }
-                    self.load_request = None;
+                    // Keep the requestId while expecting playback: a
+                    // correlated LOAD_FAILED may still arrive after BUFFERING.
+                    if self.verifying_load.is_none() {
+                        self.load_request = None;
+                    }
                     set_status(&self.status, |s| {
+                        if confirmed_load.is_some() {
+                            s.confirmed_load = confirmed_load;
+                        }
                         if let Some(t) = entry["currentTime"].as_f64() {
                             s.media_time = t;
                             s.reported_at = Some(Instant::now());
@@ -660,6 +711,7 @@ impl Pump {
                     let answered = payload["requestId"].as_u64();
                     if self.load_request.is_some() && answered == self.load_request {
                         self.load_request = None;
+                        self.verifying_load = None;
                         set_status(&self.status, |s| {
                             s.state = "error".into();
                             s.error = Some("load_failed".into());
@@ -743,6 +795,7 @@ pub(super) async fn run_session(
         media_session: None,
         pending_load: None,
         load_request: None,
+        verifying_load: None,
     };
 
     // The platform handshake: CONNECT to the platform receiver, ask it what is
@@ -881,6 +934,7 @@ pub(crate) async fn probe_receiver(ip: IpAddr, port: u16) -> Result<String, Stri
         media_session: None,
         pending_load: None,
         load_request: None,
+        verifying_load: None,
     };
     pump.send(NS_CONNECTION, RECEIVER_ID, json!({ "type": "CONNECT" }))
         .await?;
@@ -960,4 +1014,20 @@ mod tests {
         let decoded = wire::decode(&buf).expect("decodes");
         assert_eq!(decoded.namespace, "test");
     }
+}
+
+#[cfg(test)]
+#[test]
+fn reload_confirmation_ignores_previous_media_session() {
+    let url = "http://192.0.2.1/c/test/converted.mp4";
+    let mut load = LoadIdentity { id: 17, url: url.into(), media_session: None };
+    let stale = json!({"playerState": "PLAYING", "mediaSessionId": 3});
+    assert!(!load.matches(&stale, Some(9), Some(8)));
+    assert!(!load.matches(&stale, None, None));
+
+    let accepted = json!({"playerState": "BUFFERING", "mediaSessionId": 4, "media": {"contentId": url}});
+    assert!(load.matches(&accepted, Some(9), None));
+    load.media_session = accepted["mediaSessionId"].as_i64();
+    assert!(!load.matches(&stale, Some(9), None));
+    assert!(load.matches(&json!({"playerState": "PAUSED", "mediaSessionId": 4}), Some(9), None));
 }

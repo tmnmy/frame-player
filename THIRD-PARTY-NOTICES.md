@@ -38,7 +38,7 @@ GPL-only component appears.
 ## Contents
 
 - [Native libraries](#native-libraries) (47)
-- [Rust crates](#rust-crates) (442)
+- [Rust crates](#rust-crates) (445)
 - [JavaScript packages](#javascript-packages) (7)
 - [Online services](#online-services)
 - [License texts](#license-texts)
@@ -363,6 +363,7 @@ not listed: they do not reach a user's machine.
 | osakit | 0.3.1 | MIT OR Apache-2.0 |
 | parking_lot | 0.12.5 | MIT OR Apache-2.0 |
 | parking_lot_core | 0.9.12 | MIT OR Apache-2.0 |
+| pem | 3.0.6 | MIT |
 | percent-encoding | 2.3.2 | MIT OR Apache-2.0 |
 | phf | 0.13.1 | MIT |
 | phf_codegen | 0.13.1 | MIT |
@@ -400,6 +401,7 @@ not listed: they do not reach a user's machine.
 | rand_core | 0.9.5 | MIT OR Apache-2.0 |
 | rand_pcg | 0.10.2 | MIT OR Apache-2.0 |
 | raw-window-handle | 0.6.2 | MIT OR Apache-2.0 OR Zlib |
+| rcgen | 0.13.2 | MIT OR Apache-2.0 |
 | ref-cast | 1.0.26 | MIT OR Apache-2.0 |
 | ref-cast-impl | 1.0.26 | MIT OR Apache-2.0 |
 | regex | 1.13.1 | MIT OR Apache-2.0 |
@@ -552,6 +554,7 @@ not listed: they do not reach a user's machine.
 | wry | 0.55.1 | Apache-2.0 OR MIT |
 | wyz | 0.5.1 | MIT |
 | xattr | 1.6.1 | MIT OR Apache-2.0 |
+| yasna | 0.5.2 | MIT OR Apache-2.0 |
 | yoke | 0.8.3 | Unicode-3.0 |
 | yoke-derive | 0.8.2 | Unicode-3.0 |
 | zerocopy | 0.8.55 | BSD-2-Clause OR Apache-2.0 OR MIT |

@@ -9,7 +9,7 @@ import { player } from '../player.svelte';
 import { suspendThumbs } from '../thumbs.svelte';
 import { t } from '../i18n.svelte';
 import { transportCommand } from './controls';
-import { castCacheCapGb } from './prefs';
+import { castAudioMode, castCacheCapGb } from './prefs';
 import { castRecord, noteSession } from './record';
 import { cast, session } from './state.svelte';
 
@@ -38,6 +38,10 @@ export async function endCast(opts: {
   noteSession(null, opts.osd);
   const wasActive = cast.active;
   cast.active = false;
+  if (cast.audioSwitching) session.advancing = false;
+  session.audioSwitchEpoch += 1;
+  cast.audioSwitching = false;
+  cast.audioMode = castAudioMode();
   cast.state = 'idle';
   cast.deviceName = null;
   cast.kind = null;

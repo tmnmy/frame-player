@@ -4,6 +4,7 @@
   import { invoke } from '@tauri-apps/api/core';
 
   import { t } from '$lib/i18n.svelte';
+  import { forgetRemote, remote, toggleRemote } from '$lib/remote.svelte';
   import { castCacheCapGb, setCastCacheCapGb } from '$lib/cast.svelte';
   import { showOsd } from '$lib/osd.svelte';
   import { fmtSize } from '$lib/units';
@@ -43,6 +44,21 @@
 </script>
 
 <div class="set-panel">
+  <div class="setting">
+    <div class="setting-label">{t('remote.label')}</div>
+    <button class="segopt" disabled={remote.busy} onclick={() => void toggleRemote()}>
+      {t(remote.enabled ? 'remote.disable' : 'remote.enable')}
+    </button>
+    {#if remote.pairedName !== null}
+      <div class="setting-hint">{t('remote.paired_phone', { name: remote.pairedName || 'Android' })}</div>
+      <button class="segopt" onclick={() => void forgetRemote()}>{t('remote.forget_phone')}</button>
+    {:else if remote.on}
+      <div class="setting-hint">{t('remote.open_android')}</div>
+    {/if}
+    {#if remote.error}
+      <div class="setting-hint" role="status">{t(remote.error)}</div>
+    {/if}
+  </div>
   <div class="setting">
     <div class="setting-label">{t('cast.set_cache')}</div>
     <div class="segmented">

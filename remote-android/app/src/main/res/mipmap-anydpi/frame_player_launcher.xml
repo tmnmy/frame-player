@@ -1,0 +1,11 @@
+<layer-list xmlns:android="http://schemas.android.com/apk/res/android">
+    <item>
+        <shape>
+            <corners android:radius="11dp" />
+            <gradient android:angle="315" android:startColor="#191a2e" android:endColor="#0d0d18" />
+        </shape>
+    </item>
+    <item>
+        <inset android:drawable="@drawable/frame_player_logo" android:inset="20%" />
+    </item>
+</layer-list>

@@ -1,5 +1,7 @@
 <script lang="ts">
   import { onDestroy, onMount } from 'svelte';
+  import { mountRemote } from '$lib/remote.svelte';
+  import RemotePairDialog from '$lib/components/RemotePairDialog.svelte';
   import MediaInfoDialog from '$lib/components/MediaInfoDialog.svelte';
   import SubsDialog from '$lib/components/SubsDialog.svelte';
   import StartScreen from '$lib/components/StartScreen.svelte';
@@ -165,6 +167,7 @@
   const osdState = $derived(osd());
 
   onMount(boot);
+  onMount(mountRemote);
 
   onDestroy(shutdown);
 
@@ -522,3 +525,5 @@
     background: #101016;
   }
 </style>
+
+<RemotePairDialog />

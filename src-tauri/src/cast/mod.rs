@@ -79,6 +79,7 @@ pub struct CastStatus {
     pub error: Option<String>,
     pub time: f64,
     pub duration: f64,
+    pub confirmed_load: Option<u32>,
     pub volume: f64,
     pub muted: bool,
     /// Whether any receiver status has reported a volume at all, and whether
@@ -199,7 +200,9 @@ pub async fn cast_load(
     title: Option<String>,
     hidden: bool,
     hls: Option<String>,
-) -> Result<(), String> {
+    autoplay: Option<bool>,
+    verify_playback: Option<bool>,
+) -> Result<Option<u32>, String> {
     let file = PathBuf::from(&path);
     if !file.is_file() {
         return Err("no such file".into());
@@ -271,6 +274,7 @@ pub async fn cast_load(
         }
     }
 
+    let confirmation = verify_playback.unwrap_or(false).then(rand::random::<u32>);
     cmd_tx
         .send(Cmd::Load {
             url,
@@ -278,8 +282,11 @@ pub async fn cast_load(
             title: if hidden { None } else { title },
             position,
             hls_format: hls,
+            autoplay: autoplay.unwrap_or(true),
+            confirmation,
         })
-        .map_err(|_| "session ended".to_string())
+        .map_err(|_| "session ended".to_string())?;
+    Ok(confirmation)
 }
 
 /// LOAD a URL somebody else registered — today the torrent stream, which is
@@ -309,6 +316,8 @@ pub async fn cast_load_url(
             title,
             position,
             hls_format: None,
+            autoplay: true,
+            confirmation: None,
         })
         .map_err(|_| "session ended".to_string())
 }
@@ -408,6 +417,7 @@ pub fn cast_status(service: tauri::State<'_, Arc<CastService>>) -> CastStatus {
         error: status.error.clone(),
         time,
         duration: status.duration,
+        confirmed_load: status.confirmed_load,
         volume: status.volume,
         muted: status.muted,
         volume_known: status.volume_control.is_some(),
@@ -460,11 +470,12 @@ pub fn cast_prepare_cached(
     path: String,
     audio_index: i64,
     transcode_audio: bool,
+    stereo: Option<bool>,
 ) -> Option<String> {
     let src = PathBuf::from(&path);
     let meta = src.metadata().ok()?;
     let dir = crate::portable::cache_dir(&app).ok()?.join("cast");
-    let key = prepare_key(&src, &meta, audio_index, transcode_audio);
+    let key = prepare_key(&src, &meta, audio_index, transcode_audio, stereo.unwrap_or(false));
     let out = dir.join(format!("{key}.mp4"));
     (out.is_file() && out.metadata().map(|m| m.len() > 0).unwrap_or(false))
         .then(|| out.to_string_lossy().into_owned())
@@ -477,6 +488,7 @@ pub async fn cast_prepare(
     path: String,
     audio_index: i64,
     transcode_audio: bool,
+    stereo: Option<bool>,
     channels: i64,
     hevc_tag: bool,
     duration: f64,
@@ -487,7 +499,7 @@ pub async fn cast_prepare(
     let dir = crate::portable::cache_dir(&app)?.join("cast");
     std::fs::create_dir_all(&dir).map_err(|e| e.to_string())?;
 
-    let key = prepare_key(&src, &meta, audio_index, transcode_audio);
+    let key = prepare_key(&src, &meta, audio_index, transcode_audio, stereo.unwrap_or(false));
     let out = dir.join(format!("{key}.mp4"));
     if out.is_file() && out.metadata().map(|m| m.len() > 0).unwrap_or(false) {
         return Ok(out.to_string_lossy().into_owned());
@@ -500,7 +512,7 @@ pub async fn cast_prepare(
     tauri::async_runtime::spawn_blocking(move || {
         run_prepare(
             &app, &service, &ffmpeg, &src, &tmp, &out_result,
-            audio_index, transcode_audio, channels, hevc_tag, duration, cap_bytes,
+            audio_index, transcode_audio, stereo.unwrap_or(false), channels, hevc_tag, duration, cap_bytes,
         )
     })
     .await
@@ -558,7 +570,7 @@ pub async fn cast_prepare_tracks(
             return Err(e);
         }
         std::fs::rename(&tmp, &out_result).map_err(|e| format!("{e}"))?;
-        prune_cast_cache(out_result.parent().unwrap_or(std::path::Path::new(".")), &out_result, cap_bytes);
+        prune_cast_cache(out_result.parent().unwrap_or(std::path::Path::new(".")), &out_result, served_path(&service).as_deref(), cap_bytes);
         Ok(())
     })
     .await

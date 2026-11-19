@@ -10,25 +10,35 @@ import { player, type Track } from '../player.svelte';
 import { airplaySwitch } from './airplay';
 import { endCast } from './handback';
 import { CAST_AUDIO_COPY } from './ladder';
+import { castAudioMode, castCacheCapGb, rememberCastAudioMode, type CastAudioMode } from './prefs';
 import { prepareForCast, prepareHls } from './prepare';
 import { cast, session } from './state.svelte';
 
-/**
- * Switch the TV to another audio track mid-session.
- *
- * The prepared file carries exactly one audio track, so this is a re-prepare
- * from the original source with the new track (instant when that variant is
- * already cached) and a LOAD at the TV's current position. `cast.state` is
- * deliberately left alone: the TV keeps playing the old track while ffmpeg
- * runs, and flipping to 'preparing' would hand the whole UI back to the paused
- * local player mid-cast.
- */
+export function castAudioModeAvailable(): boolean {
+  if (!cast.active) return true;
+  return cast.transport === 'cast' && !session.sessionHls && !!session.castSrcPath
+    && (cast.state === 'playing' || cast.state === 'paused')
+    && player.audioTracks.some((track) => track.selected && !track.external);
+}
+
+export async function setCastAudioMode(mode: CastAudioMode): Promise<boolean> {
+  if (!castAudioModeAvailable() || cast.audioSwitching) return false;
+  if (!cast.active) {
+    rememberCastAudioMode(mode);
+    cast.audioMode = mode;
+    return true;
+  }
+  if (mode === cast.audioMode && mode === castAudioMode()) return true;
+  const track = player.audioTracks.find((track) => track.selected && !track.external);
+  if (!track || !await reloadCastAudio(track, mode)) return false;
+  rememberCastAudioMode(mode);
+  cast.audioMode = mode;
+  return true;
+}
+
+/** The track used by the TV follows the selected output mode. */
 export async function castSwitchAudio(track: Track): Promise<void> {
-  const src = session.castSrcPath;
-  if (!cast.remote || !src) return;
-  // Over DLNA the renderer got the original file with every track in it, so the
-  // choice is the television's own and ours to stay out of — re-sending the
-  // file to change it would restart playback for nothing.
+  if (!cast.remote || !session.castSrcPath) return;
   if (cast.transport === 'dlna') {
     showOsd(t('cast.track_on_tv'));
     return;
@@ -37,41 +47,92 @@ export async function castSwitchAudio(track: Track): Promise<void> {
     await airplaySwitch({ audio: track });
     return;
   }
+  if (await reloadCastAudio(track, cast.audioMode)) showOsd(track.label);
+}
+
+async function reloadCastAudio(track: Track, mode: CastAudioMode): Promise<boolean> {
+  const src = session.castSrcPath;
+  if (!cast.remote || !src || session.advancing || cast.audioSwitching || track.external) return false;
+  const audioIndex = player.audioTracks.filter((candidate) => !candidate.external).indexOf(track);
+  if (audioIndex < 0) return false;
+
   const codec = track.codec?.toLowerCase() ?? null;
-  const transcode = !(codec && CAST_AUDIO_COPY.includes(codec));
-  const audioIndex = Math.max(0, player.audioTracks.indexOf(track));
+  const stereo = mode === 'stereo';
+  const transcode = stereo || !(codec && CAST_AUDIO_COPY.includes(codec));
   const channels = track.channels ?? 6;
   const hidden = isPrivatePath(src);
   const previous = session.preparedPath;
+  const hls = session.sessionHls;
+  const epoch = ++session.audioSwitchEpoch;
+  const current = () => session.audioSwitchEpoch === epoch && cast.active
+    && cast.transport === 'cast' && session.castSrcPath === src;
+  cast.audioSwitching = true;
+  let reloading = false;
+  let dispatched = false;
+  let paused = cast.paused;
+  const failure = async () => {
+    if (!current()) return;
+    if (dispatched) {
+      // The new URL displaced the old registration. If it was not accepted,
+      // recover playback on the PC instead of leaving the remote on Loading.
+      await endCast({ osd: t('cast.err_load'), resumeLocal: true, resumePaused: paused });
+    } else {
+      showOsd(t(reloading ? 'cast.err_load' : 'cast.prepare_failed'));
+    }
+  };
   try {
-    // The switch follows the session's transport: an HLS session gets a fresh
-    // rendition (the displaced session dir is cleaned by cast_load Rust-side),
-    // a progressive one re-prepares the MP4 (cached per track).
-    const prepared = session.sessionHls
-      ? await prepareHls(src, transcode, audioIndex, channels, session.sessionHls === 'fmp4')
-      : await prepareForCast(src, transcode, audioIndex, channels);
-    if (!cast.active) return;
-    await invoke('cast_load', {
+    // Keep playing the old file while the new audio is prepared. Read the
+    // TV's pause and position only at the moment of handover.
+    const prepared = hls
+      ? await prepareHls(src, transcode, audioIndex, channels, hls === 'fmp4')
+      : await prepareForCast(src, transcode, audioIndex, channels, stereo);
+    if (!current() || session.advancing) return false;
+    const latest = await invoke<{ state: string; time: number }>('cast_status');
+    if (!current() || session.advancing) return false;
+    if (!['playing', 'paused', 'buffering'].includes(latest.state)) return false;
+    paused = latest.state === 'paused';
+    reloading = true;
+    session.advancing = true;
+    const confirmation = await invoke<number>('cast_load', {
       path: prepared,
-      position: cast.time,
+      position: latest.time,
       title: hidden ? null : player.displayTitle,
       hidden,
-      hls: session.sessionHls,
+      hls,
+      autoplay: !paused,
+      verifyPlayback: true,
     });
-    if (!session.sessionHls) {
+    dispatched = true;
+    if (!current()) return false;
+    if (!hls) {
       session.preparedPath = prepared;
       session.preparedHidden = hidden;
-      // The variant just replaced must not linger for a private file; a public
-      // one stays cached for switching back.
-      if (hidden && previous && previous !== prepared) {
+      if ((hidden || castCacheCapGb() === 0) && previous && previous !== prepared) {
         void invoke('cast_forget_prepared', { path: previous }).catch(() => {});
       }
     }
-    showOsd(track.label);
+    const deadline = Date.now() + 14_000;
+    while (current() && Date.now() < deadline) {
+      const status = await invoke<{ state: string; confirmed_load?: number | null }>('cast_status');
+      if (!current()) return false;
+      if (status.confirmed_load === confirmation && ['playing', 'paused'].includes(status.state)) {
+        cast.state = status.state;
+        return true;
+      }
+      if (['error', 'stopped', 'idle'].includes(status.state)) break;
+      await new Promise((resolve) => setTimeout(resolve, 300));
+    }
+    await failure();
+    return false;
   } catch (e) {
-    console.warn('castSwitchAudio failed:', e);
-    // The session survives on the old track; the popup must still be replaced.
-    if (cast.active) showOsd(t('cast.prepare_failed'));
+    console.warn('cast audio reload failed:', e);
+    await failure();
+    return false;
+  } finally {
+    if (session.audioSwitchEpoch === epoch) {
+      cast.audioSwitching = false;
+      if (reloading) session.advancing = false;
+    }
   }
 }
 

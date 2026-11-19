@@ -40,7 +40,7 @@ export {
   type Transport,
   type TvDevice,
 } from './cast/state.svelte';
-export { castCacheCapGb, castMode, setCastCacheCapGb, setCastMode, type CastMode } from './cast/prefs';
+export { castAudioMode, castCacheCapGb, castMode, setCastCacheCapGb, setCastMode, type CastAudioMode, type CastMode } from './cast/prefs';
 export { lastCastSession, type CastRecord } from './cast/record';
 export {
   castStateLabel,
@@ -69,4 +69,4 @@ export {
 export { disconnectCast, endCast } from './cast/handback';
 export { airplayAudioSource } from './cast/airplay';
 export { castAdvance, castCurrentFile, castFollow, castFollowing, castOverAirPlay } from './cast/session';
-export { castSwitchAudio, castSwitchSub } from './cast/tracks';
+export { castAudioModeAvailable, castSwitchAudio, castSwitchSub, setCastAudioMode } from './cast/tracks';

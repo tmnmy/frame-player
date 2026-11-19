@@ -41,6 +41,7 @@ export async function prepareForCast(
   transcodeAudio: boolean,
   audioIndex: number,
   channels: number,
+  stereo = false,
 ): Promise<string> {
   // A variant already in the cache needs no popup at all: "preparing 0%" over
   // work that takes no time reads as a glitch, and anything that delays its
@@ -49,6 +50,7 @@ export async function prepareForCast(
     path,
     audioIndex,
     transcodeAudio,
+    stereo,
   }).catch(() => null);
   if (cached) return cached;
 
@@ -58,6 +60,7 @@ export async function prepareForCast(
       path,
       audioIndex,
       transcodeAudio,
+      stereo,
       channels,
       hevcTag: video === 'hevc',
       duration: player.duration,

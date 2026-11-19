@@ -90,6 +90,7 @@ async fn discover_smoke() {
         media_session: None,
         pending_load: None,
         load_request: None,
+        verifying_load: None,
     };
     pump.send(NS_CONNECTION, RECEIVER_ID, json!({ "type": "CONNECT" }))
         .await
@@ -233,6 +234,8 @@ async fn load_probe() {
 
     cmd_tx
         .send(Cmd::Load {
+            autoplay: true,
+            confirmation: None,
             url,
             mime,
             title: Some("probe".into()),

@@ -29,7 +29,7 @@ import { transportCommand } from './controls';
 import { deviceKind, dlnaRefused, extensionOf, mimeAdvertised, refusedKey, transportFor } from './devices';
 import { endCast, stopPoll } from './handback';
 import { airplayVerdict, castVerdict, resolveCastSource } from './ladder';
-import { castMode } from './prefs';
+import { castAudioMode, castMode } from './prefs';
 import { dlnaSubtitle, hlsVariant, prepareForCast, prepareHls, selectedAudioParams } from './prepare';
 import { noteSession } from './record';
 import { AIRPLAY_DEVICE, cast, session, type Anchor, type CastStatusMsg, type TvDevice, type Transport } from './state.svelte';
@@ -52,13 +52,13 @@ let sawPlayback = false;
  */
 export async function castCurrentFile(
   device: TvDevice,
-  opts: { keepSession?: boolean; forceTransport?: Transport } = {},
+  opts: { keepSession?: boolean; forceTransport?: Transport; startAt?: number } = {},
 ): Promise<boolean> {
   const keep = opts.keepSession === true;
   // A fresh session may fall back again; a re-load inside one may not, or a
   // transport that keeps refusing would ping-pong.
   if (!keep && !opts.forceTransport) fellBack = false;
-  if (device.airplay) return castOverAirPlay(null, keep);
+  if (device.airplay) return castOverAirPlay(null, keep, opts.startAt);
   session.currentDevice = device;
   cast.kind = deviceKind(device);
   const path = player.filePath;
@@ -72,10 +72,10 @@ export async function castCurrentFile(
   // and it is not a choice: nothing can be prepared from bytes that have not
   // arrived, and the segmenter would cost the release its codecs even if it
   // could. So it is DLNA or an honest refusal.
-  if ('stream' in resolved) return castTorrentStream(device, resolved.stream, keep);
+  if ('stream' in resolved) return castTorrentStream(device, resolved.stream, keep, opts.startAt);
   const src = resolved.src;
   const transport = opts.forceTransport ?? transportFor(device, src);
-  if (transport === 'dlna') return castOverDlna(device, src, keep);
+  if (transport === 'dlna') return castOverDlna(device, src, keep, opts.startAt);
 
   const verdict = await castVerdict(src);
   if (verdict.kind === 'refuse') {
@@ -102,7 +102,7 @@ export async function castCurrentFile(
   cast.active = true;
   cast.deviceName = device.name;
   cast.state = keep ? 'loading' : 'connecting';
-  cast.time = player.timePos;
+  cast.time = opts.startAt ?? player.timePos;
   cast.duration = player.duration;
   sawPlayback = false;
 
@@ -117,14 +117,21 @@ export async function castCurrentFile(
   // included — the mode is the transport, and half its purpose today is
   // letting the receiver's HLS behavior be tested with known-good files.
   session.sessionHls = mode === 'hls' ? await hlsVariant() : null;
+  const selectedAudio = player.audioTracks.find((track) => track.selected);
+  const stereo = !session.sessionHls && castAudioMode() === 'stereo'
+    && !!selectedAudio && !selectedAudio.external;
+  cast.audioMode = session.sessionHls || stereo ? 'stereo' : 'auto';
   let castPath = src;
-  if (session.sessionHls || verdict.kind === 'prepare') {
+  if (session.sessionHls || stereo || verdict.kind === 'prepare') {
     cast.state = 'preparing';
     try {
       const { audioIndex, channels } = await selectedAudioParams();
+      const embeddedIndex = stereo
+        ? player.audioTracks.filter((track) => !track.external).indexOf(selectedAudio!)
+        : audioIndex;
       castPath = session.sessionHls
         ? await prepareHls(src, verdict.transcodeAudio, audioIndex, channels, session.sessionHls === 'fmp4')
-        : await prepareForCast(src, verdict.transcodeAudio, audioIndex, channels);
+        : await prepareForCast(src, verdict.transcodeAudio || stereo, embeddedIndex, channels, stereo);
     } catch (e) {
       console.warn('cast prepare failed:', e);
       // Canceled by an endCast from elsewhere — that path already spoke.
@@ -143,13 +150,13 @@ export async function castCurrentFile(
   // handback is a seek rather than a reopen.
   await setProperty('pause', true).catch(() => {});
   cast.state = 'loading';
-  cast.time = player.timePos;
+  cast.time = opts.startAt ?? player.timePos;
   session.loadStartedAt = Date.now();
 
   try {
     await invoke('cast_load', {
       path: castPath,
-      position: player.timePos,
+      position: opts.startAt ?? player.timePos,
       title: hidden ? null : player.displayTitle,
       hidden,
       hls: session.sessionHls,
@@ -193,6 +200,7 @@ async function castTorrentStream(
   device: TvDevice,
   stream: { infoHash: string; index: number; name: string; ext: string },
   keep = false,
+  startAt?: number,
 ): Promise<boolean> {
   // Two ways in, and neither is a preference. A renderer that lists the
   // container takes the release untouched — the wide door, since torrents are
@@ -261,11 +269,12 @@ async function castTorrentStream(
   }
 
   cast.transport = dlnaTakes ? 'dlna' : 'cast';
+  cast.audioMode = 'auto';
   suspendThumbs(true);
   cast.active = true;
   cast.deviceName = device.name;
   cast.state = 'loading';
-  cast.time = player.timePos;
+  cast.time = startAt ?? player.timePos;
   cast.duration = player.duration;
   sawPlayback = false;
   session.castSrcPath = null;
@@ -279,7 +288,7 @@ async function castTorrentStream(
       await invoke('dlna_load_url', {
         subtitle: session.dlnaSubPath,
         url,
-        position: player.timePos,
+        position: startAt ?? player.timePos,
         title: hidden ? null : player.displayTitle,
         duration: player.duration,
         // The renderer's own spelling, which is why `dlnaTakes` is true at all.
@@ -294,7 +303,7 @@ async function castTorrentStream(
       await invoke('cast_load_url', {
         url,
         name: stream.name,
-        position: player.timePos,
+        position: startAt ?? player.timePos,
         title: hidden ? null : player.displayTitle,
       });
     }
@@ -316,7 +325,7 @@ async function castTorrentStream(
  * Main-10 HDR10 MKV with E-AC-3 5.1 plays, seeks (the TV reads the MKV's own
  * cues and range-requests the offset itself) and keeps its surround.
  */
-async function castOverDlna(device: TvDevice, src: string, keep = false): Promise<boolean> {
+async function castOverDlna(device: TvDevice, src: string, keep = false, startAt?: number): Promise<boolean> {
   const renderer = device.dlna;
   if (!renderer) return false;
   if (isNetworkSource(src)) {
@@ -337,11 +346,12 @@ async function castOverDlna(device: TvDevice, src: string, keep = false): Promis
   }
 
   cast.transport = 'dlna';
+  cast.audioMode = 'auto';
   suspendThumbs(true);
   cast.active = true;
   cast.deviceName = device.name;
   cast.state = 'loading';
-  cast.time = player.timePos;
+  cast.time = startAt ?? player.timePos;
   cast.duration = player.duration;
   sawPlayback = false;
   session.castSrcPath = src;
@@ -354,7 +364,7 @@ async function castOverDlna(device: TvDevice, src: string, keep = false): Promis
   try {
     await invoke('dlna_load', {
       path: src,
-      position: player.timePos,
+      position: startAt ?? player.timePos,
       title: hidden ? null : player.displayTitle,
       hidden,
       subtitle: session.dlnaSubPath,
@@ -383,7 +393,7 @@ async function castOverDlna(device: TvDevice, src: string, keep = false): Promis
  * `keep` is the queue following on a live route: a new item on the same
  * player, no list.
  */
-export async function castOverAirPlay(anchor: Anchor | null, keep = false): Promise<boolean> {
+export async function castOverAirPlay(anchor: Anchor | null, keep = false, startAt?: number): Promise<boolean> {
   if (!IS_MAC) return false;
   if (!keep) fellBack = false;
   const path = player.filePath;
@@ -419,9 +429,10 @@ export async function castOverAirPlay(anchor: Anchor | null, keep = false): Prom
     cast.kind = 'airplay';
   }
   cast.transport = 'airplay';
+  cast.audioMode = 'auto';
   cast.active = true;
   cast.state = keep ? 'loading' : 'connecting';
-  cast.time = player.timePos;
+  cast.time = startAt ?? player.timePos;
   cast.duration = player.duration;
   sawPlayback = false;
   session.castSrcPath = src;
@@ -459,13 +470,13 @@ export async function castOverAirPlay(anchor: Anchor | null, keep = false): Prom
 
   try {
     if (keep) {
-      await invoke('airplay_replace', { path: castPath, position: player.timePos, hidden });
+      await invoke('airplay_replace', { path: castPath, position: startAt ?? player.timePos, hidden });
       session.loadStartedAt = Date.now();
     } else {
       // Up until the television takes over — replaced by "playing on" from
       // the poll, or by whatever ends the session.
       showOsd(t('cast.airplay_pick'), { sticky: true });
-      await invoke('airplay_open', { path: castPath, position: player.timePos, hidden, anchor });
+      await invoke('airplay_open', { path: castPath, position: startAt ?? player.timePos, hidden, anchor });
     }
     if (session.airplayHls) await invoke('airplay_select', airplaySelection());
   } catch (e) {
@@ -489,7 +500,7 @@ async function poll() {
   // several episodes at once.
   if (!cast.active || session.advancing) return;
   const status = await invoke<CastStatusMsg>(transportCommand('status')).catch(() => null);
-  if (!status || !cast.active) return;
+  if (!status || !cast.active || session.advancing) return;
   noteSession(status);
 
   cast.state = status.state;
@@ -616,7 +627,10 @@ export async function castAdvance(
   offset: number,
   opts: { auto?: boolean } = {},
 ): Promise<boolean> {
-  if (opts.auto && !playlist.autoAdvance) return false;
+  if (opts.auto) {
+    if (player.loopMode === 'one') return sawPlayback && replayCast();
+    if (!playlist.autoAdvance) return false;
+  }
   const entry = neighbour(offset);
   // `neighbour` wraps under repeat-all, which on a one-entry queue answers with
   // the file that just finished; re-casting it is a legitimate repeat, so only
@@ -629,9 +643,10 @@ export async function castAdvance(
 /// and what `castAdvance` resolves to.
 export async function castFollow(entry: PlaylistEntry): Promise<boolean> {
   const device = session.currentDevice;
-  if (!device || !cast.active) return false;
+  if (!device || !cast.active || cast.audioSwitching || session.advancing) return false;
 
   const before = player.filePath;
+  if (entry.index === player.playlistPos && entry.path === before) return replayCast();
   session.advancing = true;
   try {
     await playEntry(entry);
@@ -649,6 +664,19 @@ export async function castFollow(entry: PlaylistEntry): Promise<boolean> {
   }
 }
 
+
+// The receiver has already ended its media session. Reload on the same
+// transport at zero, without reopening the file that mpv is holding.
+async function replayCast(): Promise<boolean> {
+  const device = session.currentDevice;
+  if (!device || !cast.active || cast.audioSwitching || session.advancing) return false;
+  session.advancing = true;
+  try {
+    return await castCurrentFile(device, { keepSession: true, forceTransport: cast.transport, startAt: 0 });
+  } finally {
+    session.advancing = false;
+  }
+}
 
 /// True while the session is moving itself to another queue entry.
 ///

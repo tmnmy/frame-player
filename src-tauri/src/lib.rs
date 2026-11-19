@@ -3,6 +3,8 @@ use std::sync::Mutex;
 
 use tauri::{Emitter, Manager};
 
+mod remote;
+
 #[cfg(target_os = "macos")]
 mod macos_chrome;
 #[cfg(target_os = "macos")]
@@ -1360,7 +1362,14 @@ pub fn run() {
         // file server's connections outlive any one command call.
         .manage(std::sync::Arc::new(cast::CastService::default()))
         .manage(std::sync::Arc::new(dlna::DlnaService::default()))
+        .manage(remote::RemoteState::default())
         .invoke_handler(tauri::generate_handler![
+            remote::remote_enable,
+            remote::remote_disable,
+            remote::remote_decide,
+            remote::remote_snapshot,
+            remote::remote_preferences,
+            remote::remote_forget,
             take_pending_files,
             take_launch_magnet,
             open_file_ready,
