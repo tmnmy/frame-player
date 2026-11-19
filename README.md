@@ -9,3 +9,7 @@ While casting to a TV, choose **TV stereo (2.0)** under **Audio output** in the 
 - [Windows and Android source code](https://github.com/tmnmy/frame-player/tree/contribution/android-remote)
 - [Android build and pairing guide](https://github.com/tmnmy/frame-player/blob/contribution/android-remote/remote-android/README.md)
 - [Upstream contribution proposal](https://github.com/risenxxx/frame-player/issues/80)
+
+## Android remote screenshot
+
+<img src="docs/android-remote.png" width="360" alt="Frame Player Android remote with a live preview, jog wheel, playback controls, queue, and audio settings">
